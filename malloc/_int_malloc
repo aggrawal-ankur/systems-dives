@@ -1,4 +1,4 @@
-# Allocation Path-Stack In `_int_malloc`
+# Allocation Path-Stack In `_int_malloc` (Single-threaded only)
 
 Align the requested bytes before anything else.
 
