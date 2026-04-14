@@ -18,6 +18,35 @@ Node* createNode(int initVal){
   return n;
 }
 
+int pushAtHead(Node** head, Node** tail, int initVal){
+  Node* new_node = createNode(initVal);
+  if (!new_node) return -1;
+
+  /* Check empty list. */
+  if ((*head == NULL) && (*tail == NULL)){
+    *head = new_node;
+    *tail = new_node;
+    new_node->next = new_node;
+    new_node->prev = new_node;
+    return 0;
+  }
+
+  /* List with one or more nodes. */
+
+  // Step1: Set the new node's links.
+  new_node->next = *head;
+  new_node->prev = *tail;
+
+  // Step2: Modify the current lptr head and the head node.
+  (*head)->prev = new_node;
+  *head = new_node;
+
+  // Step3: Modify the tail node's next.
+  (*tail)->next = new_node;
+
+  return 0;
+}
+
 int pushAtTail(Node** head, Node** tail, int initVal){
   Node *new_node = createNode(initVal);
   if (!new_node){ return -1;}
@@ -26,6 +55,8 @@ int pushAtTail(Node** head, Node** tail, int initVal){
   if ((*head == NULL) && (*tail == NULL)){
     *head = new_node;
     *tail = new_node;
+    new_node->next = new_node;
+    new_node->prev = new_node;
     return 0;
   }
 
@@ -45,51 +76,20 @@ int pushAtTail(Node** head, Node** tail, int initVal){
   return 0;
 }
 
-int pushAtHead(Node** head, Node** tail, int initVal){
-  Node* new_node = createNode(initVal);
-  if (!new_node) return -1;
-
-  /* Check empty list. */
-  if ((*head == NULL) && (*tail == NULL)){
-    *head = new_node;
-    *tail = new_node;
-    return 0;
-  }
-
-  /* List with one or more nodes. */
-
-  // Step1: Set the new node's links.
-  new_node->next = *head;
-  new_node->prev = *tail;
-
-  // Step2: Modify the current lptr head and the head node.
-  (*head)->prev = new_node;
-  *head = new_node;
-
-  // Step3: Modify the tail node's next.
-  (*tail)->next = new_node;
-}
-
 void displayFromHead(Node* head){
   Node* tmp = head;
-  int i = 0;
-  while (tmp->next != head){
-    printf("Node%d: %d\n", i, tmp->data);
-    i++;
+  do {
+    printf("NodeValue: %d\n", tmp->data);
     tmp = tmp->next;
-  }
-  printf("Node%d: %d\n\n", i, tmp->data);
+  } while (tmp != head);
 }
 
 void displayFromTail(Node* tail){
   Node* tmp = tail;
-  int i = 5;
-  while (tmp->prev != tail){
-    printf("Node%d: %d\n", i, tmp->data);
-    i--;
+  do {
+    printf("NodeValue: %d\n", tmp->data);
     tmp = tmp->prev;
-  }
-  printf("Node%d: %d\n\n", i, tmp->data);
+  } while (tmp != tail);
 }
 
 int deleteFromHead(Node* head, Node* tail){
@@ -118,6 +118,8 @@ int deleteFromHead(Node* head, Node* tail){
 
   // Step4: free(cur_head)
   free(cur_head);
+
+  return 0;
 }
 
 int deleteFromTail(Node* head, Node* tail){
@@ -146,6 +148,8 @@ int deleteFromTail(Node* head, Node* tail){
 
   // Step4: free(cur_tail)
   free(cur_tail);
+
+  return 0;
 }
 
 int initListHeaders(Node** listHdrs, unsigned int listCount){
