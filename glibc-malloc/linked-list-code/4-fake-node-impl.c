@@ -19,12 +19,12 @@ Node* createNode(int initVal){
   return n;
 }
 
-int pushAtHead(Node** binRef, int initVal){
+int pushAtHead(Node** ListRef, int initVal){
   Node* new_node = createNode(initVal);
   if (!new_node) return -1;
 
   /* Check empty list. */
-  Node* fake_node = *binRef;
+  Node* fake_node = *ListRef;
   if (fake_node->next == fake_node){
     new_node->next = fake_node->prev;
     new_node->prev = fake_node->next;
@@ -48,12 +48,12 @@ int pushAtHead(Node** binRef, int initVal){
   return 0;
 }
 
-int pushAtTail(Node** binRef, int initVal){
+int pushAtTail(Node** ListRef, int initVal){
   Node *new_node = createNode(initVal);
   if (!new_node){ return -1;}
 
   /* Check empty list. */
-  Node* fake_node = *binRef;
+  Node* fake_node = *ListRef;
   if (fake_node->next == fake_node){
     fake_node->next = new_node;
     fake_node->prev = new_node;
@@ -77,8 +77,8 @@ int pushAtTail(Node** binRef, int initVal){
   return 0;
 }
 
-void displayFromHead(Node** binRef){
-  Node* fake_node = *binRef;
+void displayFromHead(Node** ListRef){
+  Node* fake_node = *ListRef;
   if (fake_node->next == fake_node) return;
 
   int i = 0;
@@ -90,8 +90,8 @@ void displayFromHead(Node** binRef){
   } while(tmp != fake_node);
 }
 
-void displayFromTail(Node** binRef){
-  Node* fake_node = *binRef;
+void displayFromTail(Node** ListRef){
+  Node* fake_node = *ListRef;
   if (fake_node->next == fake_node)  return;
 
   Node* tmp = fake_node->next;
@@ -101,9 +101,9 @@ void displayFromTail(Node** binRef){
   } while (tmp != fake_node);
 }
 
-int deleteFromHead(Node** binRef){
+int deleteFromHead(Node** ListRef){
   /* Empty list check. */
-  Node* fake_node = *binRef;
+  Node* fake_node = *ListRef;
   if (fake_node->next == fake_node)  return -1;
 
   /* Single node list. */
@@ -127,9 +127,9 @@ int deleteFromHead(Node** binRef){
   free(cur_head);
 }
 
-int deleteFromTail(Node** binRef){
+int deleteFromTail(Node** ListRef){
   /* Empty list check. */
-  Node* fake_node = *binRef;
+  Node* fake_node = *ListRef;
   if (fake_node->next == fake_node)  return -1;
 
   /* Single node list. */
@@ -168,18 +168,18 @@ int main(void){
   Node* listHeaders[listCount*2];
   initListHeaders(listHeaders, listCount);
 
-  Node* binRef = (Node*)((char*)(&listHeaders[0])-8);
-  pushAtHead(&binRef, 5);
-  pushAtHead(&binRef, 6);
-  pushAtHead(&binRef, 7);
-  pushAtHead(&binRef, 8);
-  pushAtHead(&binRef, 9);
-  pushAtTail(&binRef, 10);
-  pushAtTail(&binRef, 11);
-  pushAtTail(&binRef, 12);
-  pushAtTail(&binRef, 13);
-  pushAtTail(&binRef, 14);
-  deleteFromHead(&binRef);
-  deleteFromTail(&binRef);
-  displayFromTail(&binRef);
+  Node* ListRef = (Node*)((char*)(&listHeaders[0])-8);
+  pushAtHead(&ListRef, 5);
+  pushAtHead(&ListRef, 6);
+  pushAtHead(&ListRef, 7);
+  pushAtHead(&ListRef, 8);
+  pushAtHead(&ListRef, 9);
+  pushAtTail(&ListRef, 10);
+  pushAtTail(&ListRef, 11);
+  pushAtTail(&ListRef, 12);
+  pushAtTail(&ListRef, 13);
+  pushAtTail(&ListRef, 14);
+  deleteFromHead(&ListRef);
+  deleteFromTail(&ListRef);
+  displayFromTail(&ListRef);
 }
