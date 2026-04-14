@@ -24,6 +24,9 @@ A complete description of glibc-malloc
     - [Macro #8 -\> chunk2mem](#macro-8---chunk2mem)
 - [Binning, The Bookkeeping Process (Actively writing)](#binning-the-bookkeeping-process-actively-writing)
   - [Implementation of `bins`](#implementation-of-bins)
+    - [The problem](#the-problem)
+    - [Finding the solution](#finding-the-solution)
+    - [Implementing the solution](#implementing-the-solution)
 ---
 
 # Introduction To Userspace Memory Allocators
@@ -837,15 +840,144 @@ Therefore, ***the `bins` data structure is implemented as an array of **list hea
 
 We have an array-based implementation for both `List*` and `Node*`. Checkout [list_ptr-array.c](./linked-list-code/2-list_ptr-array.c) and [node_ptr-array.c](./linked-list-code/3-node_ptr-array.c)
 
+**I'd recommend you to read both the implementations above, at least the "node_ptr-array" implementation, as it is used in the next part.**
+
 Everything is familiar so far, let's talk about the difference.
 
----
+### The problem
 
-We have an array of `Node*` elements. **What are the different methods to traverse this array?** The question might sound strange, and to some extent, it is.
-
-So far, we understand an implementation, where
+We have an array of `Node*` elements, and an implementation, where
   1. the head/tail pointers point to the first and the last nodes in a list,
   2. the head/tail pointers create **ends** in the list while the next/prev pointers (per node) create circularity, and
   3. an empty list has the head/tail pointers NULL.
 
-To understand the problem with this implementation, we have to dive into the push/delete logic.
+The push/delete strategy is divided into: *single node list* and *multiple node list*.
+
+The strategy is simple and works great, but let's come back to what we are doing. The linked list here is a part of a low level code, which has to be as efficient as it is possible.
+
+The push/delete code is one of the most used operations and the bottleneck is sitting right in the start of this path, i.e. the "*single node list*" pathway. *For every list, we have to check if it is a singular list.*
+
+We need a solution that makes the push/delete logic branchless, a complete happy path. Let's start thinking.
+
+### Finding the solution
+
+The listHeaders in `node_ptr-array.c` are fixed to the head/tail nodes in the list. If the list is empty, they are NULL.
+
+That's how a single list look likes:
+```c
+head<->node1<->tail
+```
+
+When a node is added to it, let's say, on the tail, it becomes:
+```c
+head<->node1<->node2<->tail
+```
+
+When we print the list, we anchor the start and the end with the head/tail pointers; We don't rely on the next/prev pointers because, they maintain circularity.
+
+The head/tail pointers are fixed to whatever the head/tail node is in the list at any instance. That's the bottleneck.
+
+The listHeaders only provide the pointer to the head/tail nodes. They themselves don't participate in the push/delete process. That's the reason they must be set NULL when the list empty.
+
+***The solution is to make the listHeaders participate in the process. They must not be treated separately when the list is empty.***
+
+Let's implement the solution.
+
+### Implementing the solution
+
+To implement this solution, we have to change how we use the listHeaders. The listHeaders[] is defined as:
+```c
+struct Node{
+  int data;
+  struct Node* next;
+  struct Node* prev;
+}
+
+struct Node* listHeaders[nbins*2];
+```
+
+**Reminder: The struct will have 4 padding bytes after the `data` member to keep alignment.**
+
+For list0, the headers are listHeaders[0] and listHeaders[1]. For list1, the headers are listHeaders[2] and listHeaders[3]. For nth list, the headers will be `listHeaders[i*2]` and `listHeaders[(i*2)+1]`
+
+If we count the lists from 1, the formula will become: `listHeaders[(i-1)*2]` and `listHeaders[((i-1)*2)+1]`
+
+---
+
+If we ask "*what actually participates in the push/delete process*", the answer would be, **nodes**. Does that mean, *to make the headers participate in the process, the headers must be nodes themselves?* Yes. The question is how!
+
+***Moments like these, where you have a rough idea about the outcome, and you need to find the process that can lead to it, but you have absolutely no substrate to think upon, one way to deal with this is to ask as many questions as you can, related or unrelated. Eventually, you will find the right one.*** So, let's ask some questions.
+
+If the headers are nodes themselves,
+  - are there distinct nodes for both the headers?, or
+  - there is one node that contains both the headers?
+
+In either of the cases, what the fields of this/these fake nodes will contain? The `data` field will be garbage for obvious reasons. What about the next/prev fields?
+
+If we had two fake nodes, the head fake node's next would probably point to the real head node and the tail fake node's prev would point the real tail node. But that still doesn't explain what happens to the prev and next of the head and the tail fake nodes.
+  
+Does the head fake node's prev point to the real tail node and the tail fake node's next points to the real head node in the list? If that is the question, we will end up with two identical fake nodes. Is it?
+
+Does that mean *we need only one fake node, whose next/prev will point to the real head/tail nodes in the list?* Something like:
+```c
+....fake_node<->new_node<->exist_node<->fake_node....
+```
+  - Congratulations. That's the answer.
+
+***We need a fake node whose next and prev align with the head and tail nodes in the list.***
+
+Now we have pinpointed what we need exactly. Let's think about how we will get it.
+
+Let's take an example. The numbers represent 64-bit addresses.
+```
+1000 :: &listHeaders[0]
+1008 :: &listHeaders[1]
+```
+
+If we need a fake node, such that, it's next/prev align with the addresses that point to the head/tail nodes in a list represented by the above headers, where should the fake node start in the memory? The answer is 992.
+
+That means, the fake node for the above headers can be obtained this way:
+```c
+struct Node* fake_node = (Node*)((char*)(&listHeaders[0])-8);
+
+fake_node->next = listHeaders[0];
+fake_node->prev = listHeaders[1];
+```
+
+To obtain a fake node suitable for the nth bin, we can do it this way:
+```c
+// 0-based indexing
+struct Node* fake_node = (Node*)((char*)(&listHeaders[i*2])-8);
+
+// 1-based indexing
+struct Node* fake_node = (Node*)((char*)(&listHeaders[(i-1)*2])-8);
+```
+
+When the list is empty, the next/prev of the fake_node will simply point to the head address itself, i.e `(Node*)((char*)(&listHeaders[i*2])-8);` or the other one.
+
+---
+
+Two things:
+  1. You don't have to worry about overwriting those 8 bytes if your pointer math is all right.
+  2. It will not raise any segmentation faults because, there is stuff that comes before this listHeaders array. The memory is already owned by the process.
+
+---
+
+To complete your understanding, open the [fake-node-impl.c](./linked-list-code/4-fake-node-impl.c). You might notice it still contains the single vs multiple distinction. Just comment that block of code and run again. You'll not be surprised that it works. [fake-node-impl(2).c](./linked-list-code/4-fake-node-impl(2).c) contains the final version of this implementation.
+
+---
+
+If you have understood the above story, congratulations, you have understood this annotation:
+```
+  To simplify use in double-linked lists, each bin header acts as 
+  a malloc_chunk. This avoids special-casing for headers. But to 
+  conserve space and improve locality, we allocate only the fd/bk 
+  pointers of bins, and then use "repositioning tricks" to treat 
+  these as the fields of a malloc_chunk*.
+```
+
+The whole story above is what the author meant by "repositioning tricks". 
+
+---
+
+So, to answer how `bins` are implemented, ***they are implemented as an array of bin headers of type mchunkptr (malloc_chunk\*). "Repositioning tricks" are used to find the correct bin.***
