@@ -14,7 +14,7 @@ A complete description of glibc-malloc
     - [The Boundary Tag Method](#the-boundary-tag-method)
   - [The Size Model](#the-size-model)
     - [The use of size\_t](#the-use-of-size_t)
-    - [Macro #1 -\> `SIZE_SZ`](#macro-1---size_sz)
+    - [Macro #1 -\> SIZE\_SZ](#macro-1---size_sz)
     - [Macro #2 -\> CHUNK\_HDR\_SZ](#macro-2---chunk_hdr_sz)
     - [Macro #3 -\> MIN\_CHUNK\_SIZE](#macro-3---min_chunk_size)
     - [Macro #4 -\> MALLOC\_ALIGNMENT](#macro-4---malloc_alignment)
@@ -23,10 +23,7 @@ A complete description of glibc-malloc
     - [Macro #7 -\> request2size](#macro-7---request2size)
     - [Macro #8 -\> chunk2mem](#macro-8---chunk2mem)
 - [Binning, The Bookkeeping Process (Actively writing)](#binning-the-bookkeeping-process-actively-writing)
-  - [Smallbins and Unsorted Bin](#smallbins-and-unsorted-bin)
-    - [Inconsistency #1](#inconsistency-1)
-    - [Indexing in `bins[]`](#indexing-in-bins)
-    - [Experiment #1](#experiment-1)
+  - [Implementation of `bins`](#implementation-of-bins)
 ---
 
 # Introduction To Userspace Memory Allocators
@@ -518,7 +515,7 @@ Now we are set to explore the macros that resolve to a numerical value.
 
 ---
 
-### Macro #1 -> `SIZE_SZ`
+### Macro #1 -> SIZE_SZ
 
 It is the width of size_t on the target machine's architecture.
 ```c
@@ -763,176 +760,92 @@ Now that we understand chunks, let's explore how freed chunks are managed, basic
 **Important Note**
   - The whole implementation of bins is filled with inconsistencies. The annotations and the macros are not converging.
   - When I was trying to build the exact structure of bins, I have gone through a lot of frustration and agitation. Sometimes, the inconsistencies would simply not make sense in a project like this.
-  - The description of bins could have been shorter and simpler iff those inconsistencies were absent. Right now, it includes dynamic analysis in substantial amount to verify the reality at runtime.
-  - Therefore, if you are perplexed at any moment, questioning "whether I am putting enough efforts", remember, the writer of this writeup has gone through them as well and what you are reading is a culmination of an understanding formed with multiple rewrites.
+  - The description of bins could have been shorter and simpler iff those inconsistencies were absent. So, the description includes dynamic analysis in substantial amount to verify the reality at runtime.
+  - Therefore, if you are perplexed at any moment, questioning "whether I am putting enough efforts", remember, the writer of this writeup has gone through them as well and what you are reading is a culmination of an understanding formed after multiple rewrites.
 
 ---
 
-***A bin is a data structure, based on "circular doubly linked lists", used to manage free chunks.***
+***A bin is a data structure, based on "circular doubly linked lists", used to manage free chunks.*** A bin is also called a "free list".
 
-**Note: The size that a bin manages includes alignment.**
+Conceptually, we have three class of bins: **smallbins** for small chunks, **largebins** for large chunks and a bin to hold chunks temporarily, called **the unsorted bin**.
 
-Conceptually, we have three class of bins: **smallbins** for small chunks, **largebins** for large chunks and a bin to hold chunks temporarily, called **unsorted bin**. But at the implementation level, we have **only one** data structure representing both class of bins. It is defined in malloc_state as:
-```c
-typedef  struct malloc_chunk*  mchunkptr
+At the implementation level, we have **only one** data structure, representing all the bins.
 
-mchunkptr bins[NBINS * 2 - 2];
-```
-  - `bins[]` store the head and tail pointers of a list. For this reason, the number of bins is multiplied by 2.
-  - The reason we subtract 2 is discussed shortly.
-
-Based on the macros and the annotations, we have 128 bins, of which, 64 are smallbins and 64 are largebins.
-```c
-#define NBINS             128
-#define NSMALLBINS        64
-```
-
-i.e,
-```c
-// mchunkptr bins[128 * 2 - 2];
-mchunkptr bins[254];
-```
-
-Let's derive the exact structure of bins[].
-
-## Smallbins and Unsorted Bin
-
-Small bins manage chunks of specific size classes while large bins manage chunks falling in specific size ranges.
-
-The state of smallbins is influenced by MALLOC_ALIGNMENT and MINSIZE.
-  - The size that a smallbin manages and the distance b/w two smallbins is decided by MALLOC_ALIGNMENT. That means, bins on 32-bit will be like {...., 48, 56, 64, 72} and the bins on 64-bit will be like {...., 48, 64, 80, 96, ....}. This is formally represented by SMALLBIN_WIDTH.
-  ```c
-  #define  SMALLBIN_WIDTH  MALLOC_ALIGNMENT
-  ```
-  - The minimum size we have a smallbin for is decided by MINSIZE. That means, the first smallbin on 64-bit is for 32 bytes and on 32-bit, it is 16 bytes.
+Before moving on to the implementation, we need to answer a question. ***Is one data structure capable of representing all the three bins? If yes, should we do it or not?***
+  - The difference b/w the three bins is only conceptual. There is no runtime difference. So the answer is simple. We can absolutely use a single data structure to represent all the bins.
+  - Should we use a single data structure or multiple is a choice matter, governed by how you want to structure the rest of the binning process. This implementation goes with the "single data structure" option, and we will try to answer why later.
 
 ---
 
-**What is the threshold for a size to be small?**
-  - The annotations do mention the threshold for smallbins on 32-bit, *quite-loosely, though*, but skips 64-bit entirely.
-  - However, MIN_LARGE_SIZE answers it.
+To understand how the core bins data structure is implemented, we must understand linked lists, especially the doubly circular linked list.
 
-*MIN_LARGE_SIZE is the smallest largebin possible in an architecture.*
+If you have taken any data structures course, you might be familiar with linked lists, but familiarity is not enough to understand this implementation.
 
-Based on these macros, we can calculate MIN_LARGE_SIZE.
-```c
-#define SMALLBIN_WIDTH          MALLOC_ALIGNMENT    // The distance b/w two small bins.
-#define SMALLBIN_CORRECTION    (MALLOC_ALIGNMENT > CHUNK_HDR_SZ)
-#define MIN_LARGE_SIZE         ((NSMALLBINS - SMALLBIN_CORRECTION) * SMALLBIN_WIDTH)
-```
-  - As usual, SMALLBIN_CORRECTION is primarily important in the third configuration. We will discuss this later.
+Moreover, data structure questions are generally solved in object oriented languages like C++/Java (this is what I have seen on the internet), which are completely different from C's procedural approach. For this reason, I have created 4 linked list implementations in the [./linked-list-code/](./linked-list-code/) directory. This does a few things.
+  - It gives a common ground to base our understanding. As a writer, I can be sure that my reader and I have the same mental model of the problem.
+  - Those who feel rusty about their understanding can quickly visit the code to remember it.
+  - At first, I was trying to find something on the internet, but I could not find anything suitable.
 
-| Config # | SMALLBIN_WIDTH | SMALLBIN_CORRECTION | MIN_LARGE_SIZE |
-| :------- | :------------- | :------------------ | :------------- |
-| 32-bit |  8 | 0 | (64-0)*8 = 512 bytes |
-| 64-bit | 16 | 0 | (64-0)*16 = 1024 bytes |
-| INTERNAL_SIZE_T=4 | 16 | 1 | (64-1)*16 = 1008 bytes | 
+Let's start with the implementation.
+
+## Implementation of `bins`
+
+A linked list have head and tail pointers to enables operations from both the ends. Let's start with implementing a single bin. We have two ways to do it.
+  1. A distinct struct, like this:
+     ```c
+     struct List{
+       struct* Node head;
+       struct* Node tail;
+     };
+     ```
+  2. Managing the head and tail pointers individually, like this:
+     ```c
+     int main(void){
+       struct Node* head;
+       struct Node* tail;
+     }
+     ```
+
+Method1 provides an abstraction, making management slightly more intuitive, and method2 initializes and uses head/tail pointers directly.
+
+Both the methods are the same, and based on the tutor's choice, you might have seen both. Personally, I have seen both, especially the first one in the cpp space. The [double circular list implementation](./linked-list-code/1-simple-dll.c) uses method1.
 
 ---
 
-Now that we know the threshold, let's list all the smallbin size classes. We can use python for this.
-```py
-# main.py
+But the `bins` data structure is a collection of multiple bins. To manage multiple bins, we have two options.
+  1. Manage the head/tail pointers individually, like this:
+     ```c
+     int main(void){
+       struct Node* l1_head;
+       struct Node* l1_tail;
+       struct Node* l2_head;
+       struct Node* l2_tail;
+       // and so on....
+     }
+     ```
+  2. Create an array of `Node*` elements.
+     ```c
+     int main(void){
+      unsigned int bin_count = 10;
+      struct Node* listHeaders[bin_count*2];
+     }
+     ```
 
-print("# 32-bit")
-for i in range(64):
-  print(i*8, end=", ")
-print("\n")
+It is clear that method1 suffers at management. So method2 is what we use.
 
-print("# 64-bit")
-for i in range(64):
-  print(i*16, end=", ")
-print("\n")
-```
+Therefore, ***the `bins` data structure is implemented as an array of **list headers** (or, bin headers), representing the head and the tail of the bin. n\*2 pointers are required for n bins, making the length of this array `n(bins) * 2`.***
 
-The output:
-```bash
-$ python3 main.py
+We have an array-based implementation for both `List*` and `Node*`. Checkout [list_ptr-array.c](./linked-list-code/2-list_ptr-array.c) and [node_ptr-array.c](./linked-list-code/3-node_ptr-array.c)
 
-# 32-bit
-0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 264, 272, 280, 288, 296, 304, 312, 320, 328, 336, 344, 352, 360, 368, 376, 384, 392, 400, 408, 416, 424, 432, 440, 448, 456, 464, 472, 480, 488, 496, 504, 
+Everything is familiar so far, let's talk about the difference.
 
-# 64-bit
-0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008, 
-```
+---
 
-Let's consider two things.
-  1. Does a chunk of size 0 bytes make sense?
-  2. We know that the smallest size for a chunk in an architecture is defined by MINSIZE. If a size, after accounting for alignment, is less than MINSIZE, we get a chunk of size MINSIZE. Does the presence of the second bin in the above two lists (8 on 32-bit and 16 on 64-bit) makes sense?
+We have an array of `Node*` elements. **What are the different methods to traverse this array?** The question might sound strange, and to some extent, it is.
 
-The answer to both the questions is a straightforward NO. Now we need to see how it is actually managed.
+So far, we understand an implementation, where
+  1. the head/tail pointers point to the first and the last nodes in a list,
+  2. the head/tail pointers create **ends** in the list while the next/prev pointers (per node) create circularity, and
+  3. an empty list has the head/tail pointers NULL.
 
-### Inconsistency #1
-
-As per this annotation:
-```
-Bin 0 does not exist. Bin 1 is the unordered list; if that 
-would be a valid chunk size the small bins are bumped up one.
-```
-bin0 doesn't exist and bin1 is the unsorted bin.
-
-There are two possible interpretations of this annotation.
-  1. Bin0 doesn't exist.
-  2. Bin0 exists, but is dormant.
-
-#2 doesn't seem to be the case and #1 means the count of smallbins is 63. That's the first inconsistency about bins. It is said that bin1 is repurposed as **the unsorted bin**, but there is no clarity about the 0th bin.
-
-Now we have to use gdb to find which hypothesis is the runtime reality. But before we do that, we have to understand the structure of `bins[]` a little more.
-
-### Indexing in `bins[]`
-
-The `bins` array is just a collection of `malloc_chunk*`. To use them to represent pointers to the first and the last chunk in a free list, we have to use what the author calls "repositioning tricks".
-```
-To simplify use in double-linked lists, each bin header acts as 
-a malloc_chunk. This avoids special-casing for headers. But to 
-conserve space and improve locality, we allocate only the fd/bk 
-pointers of bins, and then use repositioning tricks to treat 
-these as the fields of a malloc_chunk*.
-```
-
-The idea is that each pointer in `bins[]` is a fake malloc_chunk, whose fd/bk fields are pointers to the first and the last chunks in the free list.
-
-For the time, let's suppose that bins contains 5 bins. This is how `bins[]` would look like:
-```c
-mchunkptr bins[10] = {
-  bin0_fd, bin0_bk,
-  bin1_fd, bin1_bk,
-  bin2_fd, bin2_bk,
-  bin3_fd, bin3_bk,
-  bin4_fd, bin4_bk,
-}
-```
-
-If bin0_fd represents the first chunk in the bin0 linked list and we get a pointer to a memory represented by `(bin0_fd - 2*INTERNAL_SIZE_T)`, we can use that memory to represent a fake malloc_chunk, whose fd/bk offsets will land exactly at bin0_fd/bin0_bk.
-
-Let's take this example on 64-bit:
-```c
-mchunkptr bins[10] = {
-  1008:bin0_fd,
-  1016:bin0_bk,
-  1024:bin1_fd,
-  1032:bin1_bk,
-  1040:bin2_fd,
-  1048:bin2_bk,
-  1056:bin3_fd,
-  1064:bin3_bk,
-  1072:bin4_fd,
-  1080:bin4_bk,
-}
-```
-The numbers represent memory addresses.
-
-If we do the following operation:
-```c
-mchunkptr x = (mchunkptr) (char*)(&bins[0]-16)
-```
-x will point to a fake malloc_chunk starting from 992. When we check the fd of this fake chunk, we get the address to the first chunk in the list.
-
-
-### Experiment #1
-
-**Setup:** Setup the docker environment and head to `/experiment-dir/` if not already. The source code for this experiment is in exp1.c.
-
-**Objective:** Establish clarity on what happens to bin0.
-
-**Hypothesis:** Bin0 is the unsorted bin and bin1 marks the start of smallbins.
+To understand the problem with this implementation, we have to dive into the push/delete logic.
