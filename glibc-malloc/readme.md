@@ -39,6 +39,10 @@ A complete description of glibc-malloc
     - [What is the threshold that separates smallbins and largebins?](#what-is-the-threshold-that-separates-smallbins-and-largebins)
     - [What should be the smallest/first smallbin in an architecture?](#what-should-be-the-smallestfirst-smallbin-in-an-architecture)
   - [The state of largebins](#the-state-of-largebins)
+    - [The bin pyramid slop](#the-bin-pyramid-slop)
+  - [| Largebin Cat6  |  1 bin  | what's left |](#-largebin-cat6----1-bin---whats-left-)
+    - [The bin indexing macros](#the-bin-indexing-macros)
+    - [The bin\_index slop](#the-bin_index-slop)
 ---
 
 # Introduction To Userspace Memory Allocators
@@ -1140,3 +1144,300 @@ This nullifies the argument that "*if that would be a valid chunk size the small
 Here comes an end to the smallbins situation. Let's talk about largebins now. They are even more interesting.
 
 ## The state of largebins
+
+### The bin pyramid slop
+
+As mentioned earlier, there is no annotation that directly mentions the count of largebins. What we do have is this pyramid, which comes with its own issues.
+```
+    64 bins of size          8
+    32 bins of size         64
+    16 bins of size        512
+     8 bins of size       4096
+     4 bins of size      32768
+     2 bins of size     262144
+     1 bin  of size    what's left
+```
+
+1. It is only applicable for 32-bit, and it isn't mentioned explicitly, which is wrong. We know that it is for 32-bit because, the "64 bins are of size 8" line applies to 32-bit only.
+
+2. The first line is surely for smallbins, what about the rest? Yeah, we know the answer, and it might sound nitpick-y, but the annotations should mention that they are largebins.
+
+3. There is a naming slop too. If I am not wrong, "64 bins of size 8" implies "64 bins of size 8". They don't imply *there are 64 bins starting from 0 or MIN_CHUNK_SIZE, topping at (MIN_LARGE_SIZE-SMALLBIN_WIDTH), each separated by the bin width bytes.* That's inconsistency #4 and I want to propose a better framing:
+
+   | Classification | Number of bins | Width of each bin | BIN_WIDTH in pow-of-2 |
+   | :------------- | :------------- | :---------------- | :-------------------- |
+   | Smallbin       | 64 bins | 8 bytes | (2^3) |
+   | Largebin Cat1  | 32 bins | 64 bytes | (2^6) |
+   | Largebin Cat2  | 16 bins | 512 bytes | (2^9) |
+   | Largebin Cat3  |  8 bins | 4096 bytes | (2^12) |
+   | Largebin Cat4  |  4 bins | 32768 bytes | (2^15) |
+   | Largebin Cat5  |  2 bins | 262144 bytes | (2^18) |
+   | Largebin Cat6  |  1 bin  | what's left |
+   ---
+
+4. If you count the total bins in this pyramid, you will get 127, not 128, and nothing explains this. At one point, you can digest that an annotation is not aligning with the implementation. Here, an annotation is not aligning with the other one. That's inconsistency #5.
+
+---
+
+This annotation speaks about the spacing of these bins.
+```
+The bins are approximately proportionally (log) spaced.
+```
+I am not sure how to interpret this, but let's try.
+
+Focus on the power-of-2 column. Based on the log formula, i.e **log <sub>b</sub> (x) = a**, which evaluates to `b^x = a`, we will get:
+```
+2^3 = 8 <==> log2 (8) = 3
+```
+But I am not sure what comes next.
+
+---
+
+### The bin indexing macros
+
+This annotation has caused me a lot of frustration and agitation.
+```
+  There is actually a little bit of slop in the numbers in
+  bin_index for the sake of speed. This makes no difference
+  elsewhere.
+```
+
+These are the bin_index macros.
+```c
+#define in_smallbin_range(sz)    ( \
+  (unsigned long)(sz) < (unsigned long)(MIN_LARGE_SIZE) \
+)
+
+#define smallbin_index(sz)    ( \
+  ( \
+    (SMALLBIN_WIDTH == 16)     \
+    ? (((unsigned)(sz)) >> 4)  \
+    : (((unsigned)(sz)) >> 3)  \
+  ) + SMALLBIN_CORRECTION      \
+)
+
+#define largebin_index_32(sz)  ( \
+  (((unsigned long)(sz) >>  6) <= 38) ?  56 + ((unsigned long)(sz) >>  6) : \
+  (((unsigned long)(sz) >>  9) <= 20) ?  91 + ((unsigned long)(sz) >>  9) : \
+  (((unsigned long)(sz) >> 12) <= 10) ? 110 + ((unsigned long)(sz) >> 12) : \
+  (((unsigned long)(sz) >> 15) <=  4) ? 119 + ((unsigned long)(sz) >> 15) : \
+  (((unsigned long)(sz) >> 18) <=  2) ? 124 + ((unsigned long)(sz) >> 18) : \
+  126 \
+)
+
+#define largebin_index_32_big(sz)  ( \
+  (((unsigned long)(sz) >>  6) <= 45) ?  49 + ((unsigned long) (sz) >>  6) : \
+  (((unsigned long)(sz) >>  9) <= 20) ?  91 + ((unsigned long) (sz) >>  9) : \
+  (((unsigned long)(sz) >> 12) <= 10) ? 110 + ((unsigned long) (sz) >> 12) : \
+  (((unsigned long)(sz) >> 15) <=  4) ? 119 + ((unsigned long) (sz) >> 15) : \
+  (((unsigned long)(sz) >> 18) <=  2) ? 124 + ((unsigned long) (sz) >> 18) : \
+  126 \
+)
+
+// XXX It remains to be seen whether it is good to keep the widths of
+// XXX the buckets the same or whether it should be scaled by a factor
+// XXX of two as well.
+#define largebin_index_64(sz)   ( \
+  (((unsigned long)(sz) >>  6) <= 48) ?  48 + ((unsigned long)(sz) >> 6)  : \
+  (((unsigned long)(sz) >>  9) <= 20) ?  91 + ((unsigned long)(sz) >> 9)  : \
+  (((unsigned long)(sz) >> 12) <= 10) ? 110 + ((unsigned long)(sz) >> 12) : \
+  (((unsigned long)(sz) >> 15) <=  4) ? 119 + ((unsigned long)(sz) >> 15) : \
+  (((unsigned long)(sz) >> 18) <=  2) ? 124 + ((unsigned long)(sz) >> 18) : \
+  126 \
+)
+
+#define largebin_index(sz)    (  \
+  (SIZE_SZ == 8)                 \
+  ? largebin_index_64(sz)        \
+  : (MALLOC_ALIGNMENT == 16)     \
+    ? largebin_index_32_big(sz)  \
+    : largebin_index_32(sz)      \
+)
+
+#define bin_index(sz)    ( \
+  in_smallbin_range(sz)    \
+  ? smallbin_index(sz)     \
+  : largebin_index(sz)     \
+)
+```
+
+`in_smallbin_range(sz)` checks whether a size is small or not. Based on how it is used, we can be sure of the fact that the smallest value it deals with is MIN_CHUNK_SIZE and the largest value is already clear, i.e MIN_LARGE_SIZE.
+
+`smallbin_index(sz)` evaluates the correct bin number for a size. The name is very well incorrect because, "bin number" and "bin index" are two different things. That's inconsistency #6.
+  - We have 128 or 127 bins and "bin number" corresponds to that fact. We have 254 bin headers and "bin index" corresponds to that fact.
+  - *A size corresponds to a bin and a bin corresponds to a pair of headers accessible by the bin_index.* That's the difference.
+  - The macro is fairly simple. On 32-bit, we right shift by 3, which is basically "division by 8". On 64-bit, we right shift by 4, which is "division by 16".
+  - This macro essentially conforms that the first size class (0) on each architecture is invalid. You right shift 0 by anything, you get 0. The next size class, i.e 8/16 on 32/64-bit is invalid too but it is reused as the unsorted bin. So, this macro is mathematically correct but what happens to bin0 is still not clear.
+  - smallbin_index runs after in_smallbin_range, so we can be sure that only a valid smallbin size gets a bin number. This is confirmed by `bin_index(sz)`, which is a thin wrapper on the whole functionality, sort of a controller.
+
+There are 3 macros for largebin_index, or better, largebin number calculation.
+  - `largebin_index_32(sz)` is for 32-bit,
+  - `largebin_index_64(sz)` is for 64-bit, and
+  - `largebin_index_32_big(sz)` should be for INTERNAL_SIZE_T=4.
+  - `largebin_index(sz)` is the orchestrator for `largebin_index_*` macros. size_t is 8 on 64-bit, so that evaluates to largebin_index_64; INTERNAL_SIZE_T=4 is on 64-bit and to find that case, we use MALLOC_ALIGNMENT==16; Else, it is 32-bit.
+  - I have no idea about the annotation above the largebin_index_64 macro.
+
+Let's talk about the slop in these macros. This where it gets interesting, and frustrating.
+
+### The bin_index slop
+
+As discussed earlier, we will avoid largebin_index_32_big because it is for INTERNAL_SIZE_T=4.
+
+We already have the table for 32-bit, let me copy it here so that we don't have to go back-and-forth.
+
+| Classification | Number of bins | Width of each bin | BIN_WIDTH in pow-of-2 |
+| :------------- | :------------- | :---------------- | :-------------------- |
+| Smallbin       | 64 bins | 8 bytes | (2^3) |
+| Largebin Cat1  | 32 bins | 64 bytes | (2^6) |
+| Largebin Cat2  | 16 bins | 512 bytes | (2^9) |
+| Largebin Cat3  |  8 bins | 4096 bytes | (2^12) |
+| Largebin Cat4  |  4 bins | 32768 bytes | (2^15) |
+| Largebin Cat5  |  2 bins | 262144 bytes | (2^18) |
+| Largebin Cat6  |  1 bin  | what's left |
+
+---
+
+Let's start with `largebin_index_32(sz)`.
+```c
+#define largebin_index_32(sz)  ( \
+  (((unsigned long)(sz) >>  6) <= 38) ?  56 + ((unsigned long)(sz) >>  6) : \
+  (((unsigned long)(sz) >>  9) <= 20) ?  91 + ((unsigned long)(sz) >>  9) : \
+  (((unsigned long)(sz) >> 12) <= 10) ? 110 + ((unsigned long)(sz) >> 12) : \
+  (((unsigned long)(sz) >> 15) <=  4) ? 119 + ((unsigned long)(sz) >> 15) : \
+  (((unsigned long)(sz) >> 18) <=  2) ? 124 + ((unsigned long)(sz) >> 18) : \
+  126 \
+)
+```
+
+From the table, we can confirm the premise of this macro. We are dividing the size by the bin width to get a value, if that value falls in a certain range, we add a number to it to get the final bin number; otherwise, we just continue until the size satisfies a condition.
+
+MIN_LARGE_SIZE is 512 bytes on 32-bit. If we use smallbin_index(504), we get (504 >> 3) 63. Sequentially, 512 will be 64. Since 512 is a largebin size, we have to use `largebin_index_32(512)` and (512 >> 6) yields 8, which is less than 38, so it verifies the first condition and adding 56 to 8 gets us 64, which is correct.
+
+Because the first largebin yielded 8 on the first condition in the macro, and the cap is <= 38, that means, the range of correct values for this macro is [8, 38]. That means, there are 31 valid bins covered by the first condition, but the annotations say that there are 32 largebins of width 64 bytes. Where does 1 bin go? That's inconsistency #7.
+
+Because we don't know what happens to that one bin, everything downstream will be affected.
+
+We can generate the 32 bins of width 64 bytes as follows:
+```py
+x = 512
+for i in range(32):
+  print(x, end=", ")
+  x += 64
+```
+
+The output:
+```
+512, 576, 640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496,
+```
+
+According to the previous math, condition1 shouldn't verify 2496. Let's check. 2496 >> 6 is 39. This shows that condition1 only allows 31 largebins of width 64 bytes, which is against the annotations.
+
+Before we move on to the next condition, here is a question. Should we consider 31 largebins of width 64 bytes, or 32? This situation will arise multiple times and the answer is, **go with what the macro says, because, it is what that gets executed.**
+
+So, 31 largebins of 64 bytes, where the last largebin is for 2496 bytes and it's bin number is 94. If you have noticed, the first largebin was 512, which has the bin number 64. We still don't know whether bins are indexed from 0 or 1. Anyways!
+
+---
+
+So, condition2 is for 16 largebins of width 512 bytes, starting from 2496. Let's see. 2496 >> 9, we get 4, and 91 + 4 is 95. Correct. Total bins this macro will handle are [4, 20], meaning, 17. That's inconsistency #8. The annotations said "16 largebins of width 512 bytes", but the macro says "17 largebins of 512 bytes width".
+
+We can generate the bins with this script:
+```py
+x = 2496
+for i in range(17):
+  print(x, end=", ")
+  x += 512
+```
+
+The output:
+```
+2496, 3008, 3520, 4032, 4544, 5056, 5568, 6080, 6592, 7104, 7616, 8128, 8640, 9152, 9664, 10176, 10688,
+```
+
+The 10688 bin would have the bin number 111. Let's check. 10688 >> 9, we get 20, and 20+91 is 111.
+
+---
+
+Condition3 is for 8 largebins of width 4096 bytes.
+
+The first valid bin here would be 10688+512, i.e 11200. 10200 >> 12, we get 2. 2+110 is 112, which is correct. The total bins handled here are [2, 10], which is 9 bins, not 8. That's inconsistency #9. The annotations said "there are 8 largebins of width 4096 bytes", but the macro says "there are 9 largebins of width 4096 bytes".
+
+Let's generate the bins.
+```py
+x = 11200
+for i in range(9):
+  print(x, end=", ")
+  x += 4096
+```
+
+The output:
+```
+11200, 15296, 19392, 23488, 27584, 31680, 35776, 39872, 43968,
+```
+
+43968 bin's bin number would be 120.
+
+---
+
+Condition4 is for 4 largebins of width 32768 bytes. Let's see what the macro says.
+
+The first bin here would be 43968+4096, i.e 48064.
+
+48064 >> 15 is 1, and 1+119 is 120, which should not be possible because, the previous macro handled it. That's inconsistency #10. Condition4 itself is correct in its place because, it is alignment with the annotations. There are exactly 4 largebins, i.e [1, 4]. But the previous macro is violating the boundary.
+
+Now the question is, whether the bin at number 120 is a largebin of width 4096 bytes or 32768 bytes? This is legit undefined behavior, I hope so.
+
+The bins:
+```py
+x = 48064
+for i in range(4):
+  print(x, end=", ")
+  x += 32768
+```
+
+The output:
+```
+48064, 80832, 113600, 146368
+```
+
+Anyways, the last bin, i.e 146368, should be numbered 119+4 = 123. Let's check. 146368 >> 145 is 4 and 119+4 is 123.
+
+Now 48064 is the controversial bin for it existing in 2 widths at the same time. Let's consider it a 32768 width bin.
+
+---
+
+Condition5 is for 2 largebins of width 262144 bytes. The first bin here would be 146368+32768, i.e. 179136. 179136 >> 18 is 0, viola. [0, 2] means 3 bins. I am done here.
+
+The bins:
+```py
+x = 179136
+for i in range(3):
+  print(x, end=", ")
+  x += 262144
+```
+
+The output:
+```
+179136, 441280, 703424
+```
+
+The bins by this macro would be numbered as 124, 125, and 126. If 703424 has the bin number 126, and the last condition simply assigns the bin number 126 to bin which as per the annotations is "what's left", that brings us to inconsistency #11. Again, 2 bins fighting for the same number.
+
+---
+
+That brings us to the end of largebin_index_32(sz).
+
+You may ask, "is there no explanation left about the inconsistencies?" My question is, "why these inconsistences even exist in the first place?" And to answer your question, there is one explanation, but it is as sloppy as the inconsistencies here.
+```
+  - There are a lot of these bins (128). This may look 
+    excessive, but works very well in practice. Most bins 
+    hold sizes that are unusual as malloc request sizes,
+    but are more usual for fragments and consolidated sets 
+    of chunks, which is what these bins hold, so they can 
+    be found quickly.
+```
+
+It is not a question of "whether a real malloc would ever call with such sizes" or "huge sizes are for consolidated memory" or "these bins are almost never touched in 99.99% scenarios". The thing is, it is sloppy, when it shouldn't be. You can't get away with these explanations.
+
+Now the question I am trying to answer is, should I show the slop in the remaining largebin_index macros, or is it enough? Because, the situation is just the same there as well. And you have seen it first hand with largebin_index_32, so it shouldn't be a "trust me bro" case.
+
+These inconsistencies are what we will resolve at runtime with gdb.
