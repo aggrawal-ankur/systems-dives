@@ -22,13 +22,14 @@ A complete description of glibc-malloc
     - [Macro #6 -\> MINSIZE](#macro-6---minsize)
     - [Macro #7 -\> request2size](#macro-7---request2size)
     - [Macro #8 -\> chunk2mem](#macro-8---chunk2mem)
-- [The Bookkeeping System, Part 1: Implementation Of Bins](#the-bookkeeping-system-part-1-implementation-of-bins)
-  - [The problems and the solution](#the-problems-and-the-solution)
-  - [A single D.C linked list](#a-single-dc-linked-list)
+- [The Bookkeeping System, Part 0: The Problem](#the-bookkeeping-system-part-0-the-problem)
+- [The Bookkeeping System, Part 1: The Implementation Of Bins](#the-bookkeeping-system-part-1-the-implementation-of-bins)
+  - [Premise](#premise)
+  - [Single D.C linked list](#single-dc-linked-list)
   - [A collection of D.C linked lists](#a-collection-of-dc-linked-lists)
     - [Method1: List\*](#method1-list)
     - [Method2: Node\*](#method2-node)
-  - [The problem with the Node\* array implementation](#the-problem-with-the-node-array-implementation)
+  - [The Node\* array implementation](#the-node-array-implementation)
   - [How to make the push/delete logic branchless?](#how-to-make-the-pushdelete-logic-branchless)
   - [Finding the solution](#finding-the-solution)
   - [Implementing the solution](#implementing-the-solution)
@@ -770,67 +771,91 @@ This will land us at the `fd` field in the struct, where the payload memory star
 ***That's what the author probably meant when he said, "This struct declaration is misleading (but accurate and necessary)."***
 
 
-Now that we understand chunks, let's explore how freed chunks are managed, basically, **the bookkeeping process**.
+Now that we understand chunks, let's explore how freed chunks are managed, i.e, **the bookkeeping process**.
 
 ---
 
-# The Bookkeeping System, Part 1: Implementation Of Bins
+# The Bookkeeping System, Part 0: The Problem
 
-***A bin is a data structure, based on "circular doubly linked lists", used to manage free chunks.*** A bin is also called a "free list".
+The bookkeeping system sits at the core of glibc-malloc. It is the framework based on which the whole malloc-free pathways are stacked.
 
-Conceptually, we have three class of bins: **smallbins** for small chunks, **largebins** for large chunks and a bin to hold chunks temporarily, called **the unsorted bin**. This leaves us with two choices.
-  1. Implement three different containers for each bin type.
-  2. Implement one container that has pointers to all the bins.
+The bookkeeping code is one of the most challenging piece to write about and the reason is not reasonable at all, at least in my point of view. It is unnecessarily complicated and confusing.
 
-The three bins are just names given to the same backend. Therefore, at the implementation level, we have **only one** data structure, containing all the bins.
+In the chunk description, we have seen that what the author flagged as "misleading, but accurate and necessary" was just a lack of proper documentation of the design.
+
+The reason that makes documenting bins a challenging pursuit is the presence of unfathomable amount of inconsistencies that simply don't make sense. I can go to whatever length it is possible to reverse a design decision, but how I am supposed to explain the inconsistencies present in the bins section is completely out of my understanding.
+
+As we will explore, we will find that most of these inconsistencies are out of pure laziness. They could have been avoided in the first place, but no one was bothered to do that, making it a deliberate choice to keep such an important piece of code like this. They have been existing for decades and no one knows how long they will continue to exist.
+
+There are times when the annotation don't align with the implementation. Then there are times when two annotations about the same concept don't align. That's enough to break your brain.
+
+And I am not saying anything in air. I will prove everything I have said with exact references and give you everything to decide whether it is really sloppy, or it is just a bad writer.
+
+The situation is really tiring and it is in the best of our interest to avoid carrying all the three configs together. We will stick to 64-bit and later apply our understanding to the other two configs.
+
+To reduce cognitive load as much as it is possible, I have divided the exploration into three headings that build on each other.
+  1. **The implementation of bins data structure**: This is where we will explore a lookalike of `malloc_chunk` which was not properly documented and this time, the author chose to waive-off by saying "the repositioning trick".
+  2. **The state of bins**: Here we will statically explore the bins implementation and find all the inconsistencies.
+  3. **Runtime verification of the situation**: Part 2 is going to create a lot of confusion which we will resolve through dynamic analysis using gdb.
+
+Last, I will present the exact commit-ids to prove that it was always like this from the start and no one was bothered to improve it.
 
 ---
 
-A single bin is just a doubly circular linked list. But bins don't exist in isolation.
-  - We have a collection of bins, and a single data structure is supposed to contain all of them.
-  - To understand how this data structure is implemented, we have to understand the mechanics of doubly circular linked list.
+# The Bookkeeping System, Part 1: The Implementation Of Bins
 
-## The problems and the solution
+***A bin is a data structure, based on "circular doubly linked list", which is used to manage free chunks. Another name for a bin is "free list".***
+
+Conceptually, we have three class of bins: **smallbins** for small chunks, **largebins** for large chunks and a bin to hold chunks temporarily, called **the unsorted bin**. Because these are just names given to the same backend, we have two choices.
+  1. Implement three different variables for each bin type.
+  2. Implement one variable that has pointers to all the bins.
+
+Therefore, at the implementation level, we have **only one** data structure, containing pointers to all the bins, i.e, an array.
+
+There are multiple ways to implement this array. To understand which one is the best, we have to understand how a "doubly circular linked list" works.
+
+## Premise
 
 1. If you have taken any data structures course, you might be familiar with linked lists, but familiarity alone is not enough to understand this implementation.
 2. Data structure questions are generally solved in object oriented languages like C++/Java (this is what I have seen on the internet), which are completely different from C's procedural approach.
-3. I have tried to find implementations on the internet, which I can link here to save myself some time and efforts, but I couldn't find a single of them.
+3. I have tried to find implementations on the internet, which I can link here to save myself some time and efforts, but I couldn't find a single of them that satisfies the requirements.
 
-For this reason, I have created 4 linked list implementations in the [./linked-list-code/](./linked-list-code/) directory. This helps us in two interesting ways.
-  - Those who feel rusty about their understanding can quickly visit the code to strengthen it. They don't have to waste time on the internet finding one that satisfies the requirements.
+For these reasons, I have created 4 linked list implementations in the [./linked-list-code/](./linked-list-code/) directory. This is helpful in two ways.
+  - Those who feel rusty about their understanding can quickly visit the code to strengthen it. They don't have to waste time on the internet.
   - As a writer, I can be sure that my reader and I have the same base model of the problem. We can, and should, differ in the later ideas, but our foundation is the same.
 
-**Note: You don't have to visit them manually. Keep reading. I have mentioned when you need to read any of them.**
+**Note: Reading them is not a precursor. I have mentioned when it is required.**
 
 Let's revise our understanding of double circular linked lists.
 
-## A single D.C linked list
+## Single D.C linked list
 
-A double circular linked list has **head** and **tail** pointers to enable operations from both the ends. We have two ways to do it.
-  1. A distinct struct, like this:
-     ```c
-     struct List{
-       struct* Node head;
-       struct* Node tail;
-     };
-     ```
-  2. Managing the head and tail pointers individually, like this:
+A double circular linked list has **head** and **tail** pointers to create circularity. We have two ways to implement it.
+  1. Managing the head and tail pointers individually, like this:
      ```c
      int main(void){
        struct Node* head;
        struct Node* tail;
      }
      ```
+  2. A distinct struct, like this:
+     ```c
+     struct List{
+       struct* Node head;
+       struct* Node tail;
+     };
+     ```
 
-Method1 provides an abstraction, making management slightly more intuitive, while method2 initializes and uses head/tail pointers directly.
+While method1 is obvious, method2 provides an intuitive abstraction.
 
-Both the methods are the same, and based on the tutor's choice, you might have seen both. Personally, I have seen both, especially the first one in the cpp space. The [double circular list implementation](./linked-list-code/1-simple-dll.c) is based on method1. Read it and make yourself comfortable.
+In the end, both the methods are identical and based on the tutor's choice, you might have seen both. I have seen both, especially the first one in the cpp space.The [double circular list implementation](./linked-list-code/1-simple-dll.c) is based on method2. Please read it.
 
 ## A collection of D.C linked lists
 
 The `bins` data structure is a collection of bins. Regardless of what we have chosen in the previous implementation, we have two options. Either we implement the pointers manually, or we create an array of them. Both the options are demonstrated below.
 
 ### Method1: List*
+---
 
 Manage multiple `List*` manually.
 ```c
@@ -849,6 +874,7 @@ int main(void){
 ```
 
 ### Method2: Node*
+---
 
 1. Manage the head/tail pointers individually for each list.
 ```c
@@ -863,31 +889,29 @@ int main(void){
 2. Create an array of `Node*`.
 ```c
 int main(void){
-  unsigned int bin_count = 10;
-  struct Node* listHeaders[bin_count*2];
+  unsigned int listCount = 10;
+  struct Node* listHeaders[listCount*2];
 }
 ```
 
-We can notice that managing pointers individually is tiresome and error-prone, while managing an array of pointers is semantically clean and has indexing benefits.
-
-Read the [list_ptr-array.c](./linked-list-code/2-list_ptr-array.c) and [node_ptr-array.c](./linked-list-code/3-node_ptr-array.c) implementations.
-
 ---
 
-At this point, we can confirm that ***the `bins` data structure is implemented as an array of **list headers** (or, bin headers).*** But we have two worthy candidates, i.e. `List*` and `Node*` for the type of this array. The malloc implementation uses the `Node*` type. To understand why the `List*` type is not used, we have to understand why `Node*` is used.
+Managing pointers individually is tiresome and error-prone, while managing an array of pointers is semantically clean and has indexing benefits. We have an array-based implementation for both the options. Please read the [list_ptr-array.c](./linked-list-code/2-list_ptr-array.c) and [node_ptr-array.c](./linked-list-code/3-node_ptr-array.c) implementations.
 
-## The problem with the Node* array implementation
+Now we have two worthy candidates for implementing `bins[]`. glibc-malloc uses the `Node*` implementation. To understand why the `List*` implementation is not used, we have to understand why `Node*` is used.
 
-We have an array of `Node*` elements, and an implementation, where
-  1. the head/tail pointers point to the first and the last nodes in a list,
-  2. the head/tail pointers create **ends** in the list while the next/prev pointers (per node) create circularity, and
-  3. an empty list has the head/tail pointers NULL.
+## The Node* array implementation
 
-The push/delete functions are probably the most important operations here. Both the algorithms are simple, but not efficient. The algorithms are divided into *single node list* and *multiple nodes list*, and the bottleneck is right at the start of the algorithm. *For every list, we have to check if it is a singular list.*
-  - This is inefficient because, it creates a branch in the happy path.
-  - The CPU has no option but to evaluate that special case branch. This special casing becomes a bottleneck when these functions are called thousands of times (or more).
+So far, we have an array of `Node*` elements, representing the head/tail pointers of lists.
+  1. The head/tail pointers point to the first and the last nodes in a list.
+  2. The head/tail pointers act as artificial **ends** for a list while the next/prev pointers [per node] create circularity.
+  3. An empty list has the head/tail pointers NULL.
 
-We need a solution that makes the push/delete logic branchless, a complete happy path. Let's start thinking.
+The push/delete functions are probably the most important operations. They have to run multiple times. Right now, our push/delete logic is simple, but lacks efficiency.
+  - The logic is divided into *single node list* and *multiple nodes list*, and the bottleneck is right at the start of the algorithm.
+  - For every list, we have to check if it is a singular list, which is inefficient because, it creates a branch in the happy path. The CPU has no option but to evaluate the special case every single time, making the code inefficient.
+
+We need a solution that makes eliminates this "special casing" and make the the push/delete logic branchless. Let's start thinking.
 
 ## How to make the push/delete logic branchless?
 
@@ -903,13 +927,11 @@ When a node is added to it, let's say, on the tail, it becomes:
 head<->node1<->node2<->tail
 ```
 
-When we print the list, we anchor the start and the end with the head/tail pointers; We don't rely on the next/prev pointers because, they maintain circularity.
+When we print the list, we anchor the start/end with the head/tail pointers; we don't rely on the next/prev pointers because, they maintain circularity. When the list is empty, they must be set NULL. This makes the head/tail pointers sentinel beings. They don't directly participate in the push/delete logic but makes it depend on them.
 
-The head/tail pointers are fixed to whatever the head/tail node is in the list at any instance. **That's the thing we have to change.**
+***The solution is about eliminating this "special casing" and make the listHeaders participate in the process completely. They must not be treated specially when the list is empty.*** 
 
-The listHeaders only provide the pointer to the head/tail nodes. They themselves don't participate in the push/delete process. That's the reason they must be set NULL when the list empty.
-
-***The solution is to make the listHeaders participate in the process. They must not be treated specially when the list is empty.*** But how? ***We have to change how we perceive these listHeaders.***
+The question is how? ***We have to change how we perceive these listHeaders.***
 
 ## Finding the solution
 
@@ -921,32 +943,39 @@ struct Node{
   struct Node* prev;
 }
 
-struct Node* listHeaders[nbins*2];
+unsigned long listCount = 10;
+struct Node* listHeaders[listCount*2];
 ```
-**Reminder: The struct will have 4 padding bytes after the `data` member to keep alignment.**
+**Reminder: The struct will have 4 padding bytes after the `data` field to keep alignment.**
 
-We have to find which headers correspond to which list. The calculation depends on how we count the lists.
+We have to find which headers correspond to which list and the calculation depends on how we count the lists.
   - In case of 0-based indexing, list0's headers will be listHeaders[0] and listHeaders[1]; list1's headers will be listHeaders[2] and listHeaders[3]. So, the headers for the nth list will be `listHeaders[i*2]` and `listHeaders[(i*2)+1]`.
-  - In case of 1-based indexing, list1's headers will be listHeaders[0] and listHeaders[1]; list1's headers will be listHeaders[2] and listHeaders[3]; So, the headers for the nth list will be `listHeaders[(i-1)*2]` and `listHeaders[((i-1)*2)+1]`.
+  - In case of 1-based indexing, list1's headers will be listHeaders[0] and listHeaders[1]; list2's headers will be listHeaders[2] and listHeaders[3]; So, the headers for the nth list will be `listHeaders[(i-1)*2]` and `listHeaders[((i-1)*2)+1]`.
 
-**Note: You don't have to keep both the calculations active in your mind. Just remember that the formulas are different for obvious reasons.**
+Either way, the logic is remains the same.
+
+**Note: You don't have to keep the formulas active in your mind. Just be aware of the situation.**
 
 ---
 
 If we ask "*what actually participates in the push/delete process*", the answer would be, **nodes**. Does that mean, *to make the headers participate in the process, the headers must be nodes themselves?* Yes. The question is how!
 
 ***Moments like these, where you have a rough idea of the outcome you need, and you need to find the process that can lead to it, but you have absolutely no substrate to think upon, one way to deal with this is to ask as many questions as you can, related or unrelated. Eventually, you will find the right one. This is also applicable when the answer to a question is a question itself. Keep asking questions and eventually, the recursion will end.*** So, let's ask some questions.
+  - If headers need to be nodes themselves, what are headers right now? They are pointers to nodes, not nodes themselves.
   - If the headers are nodes themselves, *are there distinct nodes for both the headers?*, or, *there is one node that contains both the headers?*
   -  In either of the cases, what the fields of this/these fake nodes will contain? The `data` field will be garbage for obvious reasons. What about the next/prev fields?
-  - If we have two fake nodes, the head fake node's next would probably point to the real head node and the tail fake node's prev would point the real tail node. What happens to the prev and next of the head and the tail fake nodes?
+  - If we have two fake nodes, the head fake node's next would probably point to the real head node and the tail fake node's prev would point to the real tail node. What happens to the prev and next of the head and the tail fake nodes?
   - Does the head fake node's prev point to the real tail node and the tail fake node's next points to the real head node in the list? If that is true, we will end up with two identical fake nodes. Correct?
   - Does that mean, *we need only one fake node, whose next/prev will point to the real head/tail nodes in the list?* Something like:
     ```c
     ....fake_node<->new_node<->exist_node<->fake_node....
     ```
-  - Congratulations. That's the answer. ***We need a fake node whose next/prev point to head/tail nodes in the list.***
 
-Now the rough image of the outcome is crystal clear. Let's think about how we will get it.
+**Congratulations**. That's the answer. ***We need a fake node whose next/prev point to the head/tail nodes in the list.***
+
+---
+
+Now the rough image of the outcome is crystal clear. Let's think about how we will get to it.
 
 ## Implementing the solution
 
@@ -958,7 +987,7 @@ Let's take an example. The numbers represent 64-bit addresses.
 
 If we need a fake node, such that, it's next/prev align with the addresses that point to the head/tail nodes in a list represented by the above headers, where should the fake node start in the memory? *The answer is 992.*
 
-That means, the fake node for the above headers can be obtained this way:
+That means, the fake node for the above list headers can be obtained this way:
 ```c
 // struct Node* fake_node = (Node*) ( (char*)(&listHeaders[0]) -8);
 struct Node* fake_node = (Node*)((char*)(&listHeaders[0])-8);
@@ -967,7 +996,7 @@ fake_node->next = listHeaders[0];
 fake_node->prev = listHeaders[1];
 ```
 
-To obtain a fake node suitable for the nth bin, we can do it this way:
+To obtain a fake node suitable for the nth list, we can do it this way:
 ```c
 // 0-based indexing
 struct Node* fake_node = (Node*)((char*)(&listHeaders[i*2])-8);
@@ -976,19 +1005,19 @@ struct Node* fake_node = (Node*)((char*)(&listHeaders[i*2])-8);
 struct Node* fake_node = (Node*)((char*)(&listHeaders[(i-1)*2])-8);
 ```
 
-When the list is empty, the next/prev of the fake_node will simply point to the bin header itself, i.e `(Node*)((char*)(&listHeaders[i*2])-8);` or the other one.
+When the list is empty, the next/prev of the fake_node will simply point to the list header itself, i.e `(Node*)((char*)(&listHeaders[i*2])-8);` or the other one.
 
 ## Some concerns
 
-We are using a negative index to offset into a valid index, at least for the 0the bin. How is this legal?
+We are using a negative index to offset into a valid index, at least for the 0th list. How is this legal?
 
-An access is illegal when it doesn't align with the memory protection rights (mprotect). Right now, we are doing this on stack. We know that a process's stack is initialized by the kernel with a lot of stuff that comes before the main function. Therefore, we are not accessing a memory we don't own, which is why, we don't a segfault.
+An access is illegal when it doesn't align with the memory protection rights (mprotect). Right now, we are doing this on stack. If we are familiar with how the kernel maps a binary and prepares it for execution, we know that a process's stack is initialized by the kernel with a lot of stuff that comes before the main function. Therefore, we are not accessing a memory we don't own, which is why, we don't get a segfault.
 
-malloc_state, which is where the bins[] is allocated, goes on the static storage, and it is not the only thing that goes there and it is not the first thing that goes there. Therefore, we are not touching an address we are not meant to.
+*malloc_state*, which is where the bins[] is allocated, goes on the static storage, and it is not the only thing that goes there and it is not the first thing that goes there. Therefore, we are not touching an address we are not meant to.
 
 However, we have to be cautious about this kind of pointer arithmetic as it touches a piece of memory which might hold crucial information.
-  - If the arithmetic failed and we overwrite that memory, we are officially in the undefined behavior territory, be it overwriting 8 bytes before the listHeaders[], or any listHeaders[i*2] that is supposed to lead us to the headers corresponding to a bin.
-  - But we ensure that it doesn't happen by using that pointer only for offsetting to the right the headers; we never-ever use that address to write something.
+  - If the arithmetic failed and we overwrite that memory, we are officially in **the undefined behavior territory**.
+  - But we ensure that it doesn't happen by using that pointer only for offsetting to the right headers; we never-ever use that address to write something.
 
 ---
 
@@ -996,7 +1025,7 @@ To complete your understanding, open the [fake-node-impl.c](./linked-list-code/4
 
 ---
 
-If you have understood the above story, congratulations, you have understood this annotation:
+This is what the author titled as "the repositioning trick". And I am sort of perplexed about the title.
 ```
   To simplify use in double-linked lists, each bin header acts as 
   a malloc_chunk. This avoids special-casing for headers. But to 
@@ -1005,9 +1034,9 @@ If you have understood the above story, congratulations, you have understood thi
   these as the fields of a malloc_chunk*.
 ```
 
-The whole story above is what the author meant by "repositioning tricks".
+Anyways, if you have understood everything discussed so far but still feel "sort of incomplete", or sensing the absence of a conclusion, that goes like *"and this is how glibc-malloc does it with bins[]...."*, I want to say that "that conclusion is not possible here", for the time being. 
 
-`bin_at` is the macro that operationalize this repositioning trick, but understanding it requires concepts that I have not introduced yet. We will explore this in the next section.
+`bin_at` is the macro that operationalize this repositioning trick, which is the conclusion to this heading, but understanding it requires concepts that I have not introduced yet. Therefore, we will explore it later.
 
 ---
 
@@ -1016,14 +1045,6 @@ So to answer how `bins` are implemented, ***they are implemented as an array of 
 Now you know why a `List*` array is not suitable. It creates hurdles in implementing that "repositioning trick". However, a `List` array might make sense because, internally, it is just `Node*` elements. But in this case, it would simply be an abstraction that is no longer required.
 
 # The Bookkeeping System, Part 2: The structure of bins[]
-
-Before we start exploring this section, I want to make something clear.
-  - The whole implementation of bins is filled with inconsistencies. The annotations and the macros are not converging.
-  - When I was trying to build the exact structure of bins, I have gone through a lot of frustration and agitation. Sometimes, the inconsistencies would simply not make sense in a project like this.
-  - The description of bins could have been shorter and simpler iff those inconsistencies were absent.
-  - So, this section is largely about verifying the claims made by the annotations and the actual implementation in the code by the means of dynamic analysis using gdb. For this reason, you might feel a difference in the language, as I can't make a direct claim about anything, so I refer to the formatted source.
-  - Because the situation is very complex, it is best to keep the INTERNAL_SIZE_T=4 case to be discussed in the end.
-  - Therefore, if you are perplexed at any moment, questioning "whether I am putting enough efforts", remember, the writer of this writeup has asked such questions as well. Frustration and agitation is simply a part of exploring this section.
 
 ## The state of smallbins
 
@@ -1087,8 +1108,6 @@ Using SMALLBIN_WIDTH. ***SMALLBIN_WIDTH defines the difference b/w two smallbins
 | 32-bit |  8 bytes |
 | 64-bit | 16 bytes |
 | INTERNAL_SIZE_T=4 | 16 bytes |
-
----
 
 ### What is the threshold that separates smallbins and largebins?
 ---
